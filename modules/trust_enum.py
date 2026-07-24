@@ -210,16 +210,6 @@ class NXCModule:
             self._row(context, "Attributes", ", ".join(flag_names))
             self._row(context, "Supported Enc", ", ".join(enc_names) if enc_names else "not set", alert=enc_weak)
 
-            # trustAttributes are per-side: a bidirectional trust stores a separate
-            # TDO on each domain and the flags (esp. TGT delegation, SID filtering)
-            # can differ. This DC only shows the local side.
-            if direction == 3:
-                context.log.highlight(
-                    f"  [!] Bidirectional: above is the {local_domain} side only; "
-                    f"query a {partner} DC to read the reverse direction "
-                    f"(TGT delegation / SID filtering may differ)"
-                )
-
     def _row(self, context, label, value, alert=False):
         # Default color stays as-is (highlight = yellow); security-relevant
         # deviations from the safe default are switched to red.

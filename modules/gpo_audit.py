@@ -7,7 +7,11 @@
 # Everything else is printed in white so you still see the full picture.
 #
 # Covers SecEdit sections (Privilege Rights, Registry Keys, File Security, Service
-# settings, Group Membership) and GPP files (Groups.xml plus cpassword decryption).
+# settings, Group Membership, System Access), GPP files (Groups.xml, cpassword decryption
+# across Drives/DataSources/Printers/Services/ScheduledTasks, and Registry.xml autologon /
+# LSA / UAC / WDigest policy), and logon/startup scripts (scripts.ini plus script bodies on
+# SYSVOL and NETLOGON scanned for cleartext credentials). Everything reads from the two
+# shares any authenticated user can reach, so no elevated access is required.
 #
 #   nxc smb <targets> -u user -p pass -M gpo_audit
 
@@ -33,6 +37,29 @@ from nxc.parsers.ldap_results import parse_result_attributes
 PRIVILEGED_GROUP_RIDS = {
     "512", "516", "518", "519", "520",          # Domain/Enterprise/Schema Admins, DCs, GPCO
     "544", "548", "549", "550", "551", "552",   # Administrators, *Operators, Replicators
+}
+
+# Privileges that are a local-privesc / credential-theft primitive on their own. Microsoft's
+# default templates never hand these to a broad principal, so a low-priv trustee holding one
+# is the highest-value GPO finding (matches Group3r's LocalPrivesc/GrantsRemoteAccess set).
+DANGEROUS_PRIVILEGES = {
+    "SeTakeOwnershipPrivilege", "SeRestorePrivilege", "SeBackupPrivilege", "SeTcbPrivilege",
+    "SeCreateTokenPrivilege", "SeDebugPrivilege", "SeLoadDriverPrivilege",
+    "SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege", "SeTrustedCredManAccessPrivilege",
+    "SeRelabelPrivilege", "SeCreateSymbolicLinkPrivilege", "SeManageVolumePrivilege",
+    "SeSecurityPrivilege", "SeEnableDelegationPrivilege", "SeRemoteInteractiveLogonRight",
+}
+
+# Broad, low-privilege principals that should never appear in a dangerous slot. Their RIDs are
+# < 1000 / well-known, so the RID>=1000 rule alone misses them (e.g. Authenticated Users granted
+# SeBackupPrivilege) - this set closes that false-negative for DANGEROUS_PRIVILEGES.
+BROAD_LOWPRIV_SIDS = {
+    "S-1-1-0",          # Everyone
+    "S-1-5-7",          # Anonymous
+    "S-1-5-11",         # Authenticated Users
+    "S-1-5-32-545",     # Users
+    "S-1-5-32-546",     # Guests
+    "S-1-5-32-555",     # Remote Desktop Users
 }
 
 WELL_KNOWN_GPO = {
@@ -81,10 +108,51 @@ RIGHTS_NAMES = {
     "CR": "CONTROL_ACCESS", "NR": "NO_READ_UP", "NW": "NO_WRITE_UP", "NX": "NO_EXECUTE_UP",
 }
 
+# Cleartext-credential tells in logon/startup script bodies and GPP script parameters.
+# Kept deliberately tight to stay high-signal (net-use /user:, password= assignments, GPP
+# cpassword, PowerShell plaintext-secret idioms) rather than flagging every '-p'.
+_CRED_PATTERNS = [
+    re.compile(r"[-/](?:password|passwd|pass|pwd|pw|cred|user)\b", re.IGNORECASE),  # CLI flags: -Password, /user:, -pw
+    re.compile(r"(?:password|passwd|pwd|secret)\s*[:=]\s*\S", re.IGNORECASE),        # assignments: password=..., pwd:...
+    re.compile(r"\bnet\s+use\b.*/user", re.IGNORECASE),
+    re.compile(r"\bcmdkey\b", re.IGNORECASE),
+    re.compile(r"-AsPlainText", re.IGNORECASE),
+    re.compile(r"ConvertTo-SecureString", re.IGNORECASE),
+    re.compile(r"\bcpassword\b", re.IGNORECASE),
+]
+
 _DOMAIN_SID = re.compile(r"^S-1-5-21-\d+-\d+-\d+-(\d+)$", re.IGNORECASE)
 # One SDDL ACE: (type;flags;rights;objguid;inheritguid;sid[;extra]). Conditional ACEs
 # (XA/XD) don't appear in secedit templates, so the simple 6-field grammar is enough.
 _ACE = re.compile(r"\(([AD][^;]*);[^;]*;([^;]*);[^;]*;[^;]*;([^;)]+)")
+# scripts.ini indexed keys: 0CmdLine / 0Parameters / 1CmdLine ...
+_SCRIPT_IDX = re.compile(r"(\d+)(CmdLine|Parameters)$", re.IGNORECASE)
+
+# Sentinel for an entry's `hot`: paint the whole rendered line red (a set paints only those
+# principal cells). A named constant so a typo is a NameError, not a silently-missed literal.
+HOT_ALL = "ALL"
+
+
+def _to_int(value):
+    """Parse a REG_DWORD-ish string ('1', '0x00000001') to int, or None."""
+    value = (value or "").strip()
+    try:
+        return int(value, 16) if value.lower().startswith("0x") else int(value)
+    except ValueError:
+        return None
+
+
+# GPP Registry.xml checks: (key substring, value name, predicate(str)->bool, message).
+# Curated to the highest-value cleartext-cred / privesc / auth-downgrade policy.
+_REG_CHECKS = [
+    ("winlogon", "autoadminlogon", lambda v: _to_int(v) == 1, "Autologon ENABLED"),
+    ("installer", "alwaysinstallelevated", lambda v: _to_int(v) == 1, "AlwaysInstallElevated (MSI runs as SYSTEM)"),
+    ("control\\lsa", "lmcompatibilitylevel", lambda v: _to_int(v) is not None and _to_int(v) < 3, "LmCompatibilityLevel < 3 (NTLMv1 allowed)"),
+    ("wdigest", "uselogoncredentials", lambda v: _to_int(v) == 1, "WDigest UseLogonCredentials (cleartext creds in LSASS)"),
+    ("policies\\system", "localaccounttokenfilterpolicy", lambda v: _to_int(v) == 1, "LocalAccountTokenFilterPolicy (remote local-admin / PtH)"),
+    ("policies\\system", "enablelua", lambda v: _to_int(v) == 0, "EnableLUA=0 (UAC disabled)"),
+    ("lanmanworkstation\\parameters", "enableplaintextpassword", lambda v: _to_int(v) == 1, "EnablePlainTextPassword (plaintext SMB auth)"),
+]
 
 
 class NXCModule:
@@ -116,6 +184,19 @@ class NXCModule:
         upper = token.upper()
         return any(k in upper for k in ("ADMIN", "BACKUP OPERATOR", "SERVER OPERATOR", "ACCOUNT OPERATOR"))
 
+    def _is_broad_lowpriv(self, sid):
+        """True for broad low-priv principals that must never hold a DANGEROUS_PRIVILEGE."""
+        sid = sid.strip().lstrip("*")
+        if sid in BROAD_LOWPRIV_SIDS:
+            return True
+        m = _DOMAIN_SID.match(sid)                       # Guest/Domain Users/Guests/Computers
+        return bool(m) and m.group(1) in ("501", "513", "514", "515")
+
+    def _anomalous_principal(self, sid, broad=False):
+        """A principal that is anomalous in a sensitive slot: a specific domain account
+        (RID>=1000), or - with broad=True - a broad low-priv group (Everyone, Auth Users, ...)."""
+        return bool(self._domain_rid(sid)) or (broad and self._is_broad_lowpriv(sid))
+
     # --- primitives ----------------------------------------------------------------
 
     def _read_file(self, context, connection, share, path):
@@ -126,6 +207,20 @@ class NXCModule:
         except Exception as e:
             context.log.debug(f"Could not read {path}: {e}")
             return None
+
+    def _decode(self, data):
+        """Decode a SYSVOL text file: UTF-16 (BOM) first, then UTF-8/latin-1 fallbacks."""
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            return data.decode("utf-16", errors="ignore")
+        for enc in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="ignore")
+
+    def _looks_like_cred(self, text):
+        return any(rx.search(text) for rx in _CRED_PATTERNS)
 
     def _guid_label(self, path):
         m = re.search(r"\{[0-9A-Fa-f-]{36}\}", path)
@@ -148,13 +243,16 @@ class NXCModule:
                 sections[current].append(line)
         return sections
 
-    def _entry(self, entries, policy, section, tmpl, cells, hot):
+    def _entry(self, entries, policy, section, tmpl, cells, hot, gpp_group=None):
         # cells = list of (sid, suffix) - the principals rendered into the tmpl's {P}
-        # slot (suffix is "[right]" for ACL rows, "" otherwise). hot = the subset of
-        # those sids to paint red, or "ALL" to paint the whole line red (rows whose
-        # anomalous subject isn't a {P} principal - cpassword, GPP-add, __Memberof).
-        entries.append({"policy": policy, "section": section, "tmpl": tmpl,
-                        "cells": cells, "hot": hot})
+        # slot (suffix is "[right]" for ACL rows, "" otherwise). hot = the subset of those
+        # sids to paint red, or HOT_ALL to paint the whole line red (rows whose anomalous
+        # subject isn't a {P} principal - cpassword, GPP-add, __Memberof). gpp_group marks a
+        # GPP Groups.xml row whose anomaly is decided later in _resolve_gpp_groups.
+        entry = {"policy": policy, "section": section, "tmpl": tmpl, "cells": cells, "hot": hot}
+        if gpp_group is not None:
+            entry["gpp_group"] = gpp_group
+        entries.append(entry)
 
     def _plain(self, sids):
         """Cells with no right-suffix, for the SID-list sections."""
@@ -193,14 +291,19 @@ class NXCModule:
     # --- SecEdit / GptTmpl.inf -----------------------------------------------------
 
     def _collect_gpttmpl(self, guid, sections, entries):
-        # [Privilege Rights] - one line per privilege
+        # [Privilege Rights] - one line per privilege. A specific domain account (RID>=1000) in
+        # any slot is always anomalous; for privesc-grade rights, broad low-priv principals
+        # (Authenticated Users, Everyone, Domain Users, ...) are anomalous too.
         for line in sections.get("[Privilege Rights]", []):
             if "=" not in line:
                 continue
             priv, _, members = line.partition("=")
+            priv = priv.strip()
             row_sids = self._split_list(members)
+            broad = priv in DANGEROUS_PRIVILEGES
+            hot = {s for s in row_sids if self._anomalous_principal(s, broad=broad)}
             self._entry(entries, guid, "[Privilege Rights]",
-                        f"{priv.strip()} = {{P}}", self._plain(row_sids), self._hot(row_sids))
+                        f"{priv} = {{P}}", self._plain(row_sids), hot)
 
         # Object-ACL sections (Name,Mode,SDDL rows) - one line per key/path/service
         for section, kind in (("[Registry Keys]", "registry"),
@@ -239,7 +342,22 @@ class NXCModule:
                 princ = left[: -len("__Memberof")].lstrip("*")
                 anomaly = bool(self._domain_rid(princ)) and any(self._is_privileged_group(g) for g in members)
                 self._entry(entries, guid, "[Group Membership]",
-                            f"{princ} memberOf = {{P}}", self._plain(members), "ALL" if anomaly else set())
+                            f"{princ} memberOf = {{P}}", self._plain(members), HOT_ALL if anomaly else set())
+
+        # [System Access] - account/password policy. Surface only the settings that are an
+        # attacker primitive, not the informational policy tunables (age/length/lockout).
+        sa = {}
+        for line in sections.get("[System Access]", []):
+            k, sep, v = line.partition("=")
+            if sep:
+                sa[k.strip().lower()] = v.strip()
+        for key, msg in (
+            ("cleartextpassword", "Store passwords using reversible encryption ENABLED"),
+            ("enableguestaccount", "Guest account ENABLED"),
+            ("lsaanonymousnamelookup", "Anonymous SID/Name translation ALLOWED"),
+        ):
+            if _to_int(sa.get(key)) == 1:
+                self._entry(entries, guid, "[System Access]", msg, [], HOT_ALL)
 
     # --- GPP -----------------------------------------------------------------------
 
@@ -257,25 +375,26 @@ class NXCModule:
                 user = (el.attrib.get("userName") or el.attrib.get("accountName")
                         or el.attrib.get("runAs") or el.attrib.get("username") or "")
                 creds.append((user, pw))
-                self._entry(entries, guid, "[GPP cpassword]", f"cpassword for '{user}': {pw}", [], "ALL")
+                self._entry(entries, guid, "[GPP cpassword]", f"cpassword for '{user}': {pw}", [], HOT_ALL)
 
-        # Groups.xml: members ADDed to a group. Walk groups once so the group name is
-        # known inline - no parent lookup, no O(members*groups) rescan.
+        # Groups.xml: members ADDed to a group. Prefer the SID over the display name for both
+        # the group and each member so the "privileged group?" / "who?" checks are decided on
+        # locale-independent SIDs (a Polish/German DC names groups "Administratorzy" etc.).
+        # Names that lack a SID are stashed via gpp_group and resolved once in _resolve_gpp_groups.
         if path.lower().endswith("groups.xml"):
             for group in root.findall(".//Group"):
                 props = group.find("./Properties")
+                gsid = ((props.attrib.get("groupSid") if props is not None else "") or "").strip()
                 gname = (props.attrib.get("groupName") if props is not None else None) or group.attrib.get("name", "?")
+                group_token = gsid if gsid.startswith("S-1-") else gname
                 for member in group.findall(".//Members/Member"):
                     if member.attrib.get("action", "").upper() != "ADD":
                         continue
-                    sid = member.attrib.get("sid", "")
-                    if sid.startswith("S-1-"):          # route the member through {P} so it resolves + reddens
-                        hot = self._hot([sid]) if self._is_privileged_group(gname) else set()
-                        self._entry(entries, guid, "[GPP Groups.xml]",
-                                    f"ADD {{P}} -> group '{gname}'", [(sid, "")], hot)
-                    else:                                # member identified by name only - no SID to resolve/flag
-                        self._entry(entries, guid, "[GPP Groups.xml]",
-                                    f"ADD {member.attrib.get('name', '?')} -> group '{gname}'", [], set())
+                    msid = (member.attrib.get("sid", "") or "").strip()
+                    member_token = msid if msid.startswith("S-1-") else member.attrib.get("name", "?")
+                    self._entry(entries, guid, "[GPP Groups.xml]",
+                                f"ADD {{P}} -> group '{gname}'", [(member_token, "")], set(),
+                                gpp_group=group_token)
 
     def _decrypt_cpassword(self, cpassword):
         key = unhexlify("4e9906e8fcb66cc9faf49310620ffee8f496e806cc057990209b09a433b66c1b")
@@ -290,6 +409,141 @@ class NXCModule:
             return out.decode("utf-16-le")
         except Exception:
             return "<decrypt-failed>"
+
+    # --- logon/startup scripts (Group3r-style) -------------------------------------
+
+    def _collect_scripts_ini(self, guid, sections, entries):
+        # scripts.ini / psscripts.ini: [Startup]/[Shutdown]/[Logon]/[Logoff] with indexed
+        # NCmdLine / NParameters pairs. Flag a UNC CmdLine (attacker-writable target => code
+        # exec in the applied principal's context - we can only surface it, not test the write)
+        # and any Parameters that look like they carry cleartext credentials.
+        wanted = ("startup", "shutdown", "logon", "logoff")
+        for section, lines in sections.items():
+            if section.strip("[]").lower() not in wanted:
+                continue
+            scripts = {}
+            for line in lines:
+                k, sep, v = line.partition("=")
+                if not sep:
+                    continue
+                m = _SCRIPT_IDX.match(k.strip())
+                if m:
+                    scripts.setdefault(m.group(1), {})[m.group(2).lower()] = v.strip()
+            for idx in sorted(scripts, key=lambda x: int(x)):
+                cmd = scripts[idx].get("cmdline", "")
+                params = scripts[idx].get("parameters", "")
+                if not cmd:
+                    continue
+                cred = bool(params) and self._looks_like_cred(params)
+                note = "   [UNC - verify write access]" if cmd.strip().startswith("\\\\") else ""
+                text = f"{section.strip('[]')}: {cmd}" + (f" {params}" if params else "") + note
+                self._entry(entries, guid, "[Logon/Startup scripts]", text, [], HOT_ALL if cred else set())
+
+    def _scan_script(self, guid, path, data, entries):
+        # Read a logon/startup script body and surface lines that carry cleartext credentials.
+        fname = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        hits = 0
+        for raw in self._decode(data).splitlines():
+            line = raw.strip()
+            if line and self._looks_like_cred(line):
+                self._entry(entries, guid, f"[script: {fname}]", line[:200], [], HOT_ALL)
+                hits += 1
+                if hits >= 15:                          # cap per file - avoid flooding output
+                    break
+
+    # --- GPP Registry.xml ----------------------------------------------------------
+
+    def _collect_registry_xml(self, context, guid, data, entries, creds):
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as e:
+            context.log.debug(f"Registry.xml parse error: {e}")
+            return
+        default_user = default_pass = None
+        for props in root.iter("Properties"):
+            key = (props.attrib.get("key") or "").lower()
+            name = props.attrib.get("name") or ""
+            value = props.attrib.get("value") or ""
+            nlow = name.lower()
+            if "winlogon" in key:
+                if nlow == "defaultusername":
+                    default_user = value
+                elif nlow == "defaultpassword":
+                    default_pass = value
+            for ksub, vname, pred, msg in _REG_CHECKS:
+                if ksub in key and nlow == vname and pred(value):
+                    self._entry(entries, guid, "[GPP Registry.xml]", f"{msg}: {name}={value}", [], HOT_ALL)
+        if default_pass:
+            self._entry(entries, guid, "[GPP Registry.xml]",
+                        f"Autologon cleartext password for '{default_user or '?'}': {default_pass}", [], HOT_ALL)
+            if default_user:
+                creds.append((default_user, default_pass))
+
+    # --- GPP Groups.xml: locale-independent group/member resolution ----------------
+
+    def _resolve_gpp_groups(self, context, connection, entries):
+        # GPP Groups.xml routinely names groups/members by (localized) name with an empty SID.
+        # Resolve those names to SIDs once, then decide "privileged group?" and "who?" on the
+        # SID/RID - so a low-priv principal added to Administrators is flagged regardless of the
+        # DC's UI language. Name tokens that don't resolve fall back to the name heuristic.
+        refs = [e for e in entries if "gpp_group" in e]
+        if not refs:
+            return
+        names = set()
+        for e in refs:
+            for tok in (e["gpp_group"], e["cells"][0][0]):
+                if not tok.startswith("S-1-"):
+                    names.add(tok)
+        name2sid = self._lsa_lookup_names(context, connection, list(names)) if names else {}
+        for e in refs:
+            g_tok = e.pop("gpp_group")
+            m_tok = e["cells"][0][0]
+            group_sid = g_tok if g_tok.startswith("S-1-") else name2sid.get(g_tok)
+            member_sid = m_tok if m_tok.startswith("S-1-") else name2sid.get(m_tok)
+            if member_sid and not m_tok.startswith("S-1-"):   # swap the name cell for its SID so it resolves to DOMAIN\user
+                e["cells"] = [(member_sid, "")]
+            if self._is_privileged_group(group_sid or g_tok) and member_sid and self._anomalous_principal(member_sid, broad=True):
+                e["hot"] = {e["cells"][0][0]}
+
+    def _lsa_open(self, context, connection):
+        """Open \\lsarpc + an LSA policy handle. Returns (dce, policy) or (None, None)."""
+        try:
+            rpctransport = transport.SMBTransport(connection.host, 445, r"\lsarpc", smb_connection=connection.conn)
+            dce = rpctransport.get_dce_rpc()
+            dce.connect()
+            dce.bind(lsat.MSRPC_UUID_LSAT)
+            policy = lsad.hLsarOpenPolicy2(dce, MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES)["PolicyHandle"]
+            return dce, policy
+        except Exception as e:
+            context.log.debug(f"LSA open failed: {e}")
+            return None, None
+
+    def _lsa_lookup_names(self, context, connection, names):
+        """Best-effort name -> SID via LSA LookupNames. Returns {name: sid} for what mapped."""
+        out = {}
+        if not names:
+            return out
+        dce, policy = self._lsa_open(context, connection)
+        if not dce:
+            return out
+        try:
+            resp = lsat.hLsarLookupNames(dce, policy, names)
+        except DCERPCException as e:
+            if "STATUS_SOME_NOT_MAPPED" in str(e):
+                resp = e.get_packet()
+            else:
+                context.log.debug(f"LSA lookupNames failed: {e}")
+                return out
+        domains = resp["ReferencedDomains"]["Domains"]
+        for i, item in enumerate(resp["TranslatedSids"]["Sids"]):
+            if item["Use"] == SID_NAME_USE.SidTypeUnknown or item["DomainIndex"] < 0:
+                continue
+            try:
+                domain_sid = domains[item["DomainIndex"]]["Sid"].formatCanonical()
+                out[names[i]] = f"{domain_sid}-{item['RelativeId']}"
+            except Exception as e:
+                context.log.debug(f"LSA name->SID build failed for {names[i]}: {e}")
+        return out
 
     # --- SID resolution: well-known -> LSA -> LDAP ---------------------------------
 
@@ -309,14 +563,8 @@ class NXCModule:
 
     def _lsa_lookup(self, context, connection, sids):
         out = {}
-        try:
-            rpctransport = transport.SMBTransport(connection.host, 445, r"\lsarpc", smb_connection=connection.conn)
-            dce = rpctransport.get_dce_rpc()
-            dce.connect()
-            dce.bind(lsat.MSRPC_UUID_LSAT)
-            policy = lsad.hLsarOpenPolicy2(dce, MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES)["PolicyHandle"]
-        except Exception as e:
-            context.log.debug(f"LSA open failed: {e}")
+        dce, policy = self._lsa_open(context, connection)
+        if not dce:
             return out
         try:
             resp = lsat.hLsarLookupSids(dce, policy, sids, lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta)
@@ -364,7 +612,7 @@ class NXCModule:
         # only prefix-less, file-logged emitter nxc exposes.
         red = lambda s: colored(s, "red", attrs=["bold"])
         white = lambda s: colored(s, "white")
-        if hot == "ALL":
+        if hot == HOT_ALL:
             rendered = ", ".join(disp(sid) + suf for sid, suf in cells)
             context.log.highlight(red(f"        {tmpl.replace('{P}', rendered)}"))
             return
@@ -378,31 +626,50 @@ class NXCModule:
 
     # --- entrypoint ----------------------------------------------------------------
 
+    # Substring, case-insensitive filename match (see nxc SMBSpider.dir_list). "scripts.ini"
+    # also catches psscripts.ini; the extensions pull logon/startup script bodies to scan.
+    SPIDER_PATTERNS = [
+        "GptTmpl.inf", "Groups.xml", "Services.xml", "ScheduledTasks.xml",
+        "Drives.xml", "DataSources.xml", "Printers.xml", "Registry.xml",
+        "scripts.ini", ".bat", ".cmd", ".vbs", ".ps1",
+    ]
+
     def on_login(self, context, connection):
-        sysvol = None
+        shares = []
         for share in connection.shares():
-            if share["name"].lower() == "sysvol" and "READ" in share["access"]:
-                sysvol = share["name"]
-                break
-        if not sysvol:
-            context.log.fail("No readable SYSVOL share - cannot audit GPOs")
+            if share["name"].lower() in ("sysvol", "netlogon") and "READ" in share["access"]:
+                shares.append(share["name"])
+        if not shares:
+            context.log.fail("No readable SYSVOL/NETLOGON share - cannot audit GPOs")
             return
-        context.log.success("Found readable SYSVOL - dumping GPO settings")
+        context.log.success(f"Readable share(s): {', '.join(shares)} - dumping GPO settings")
 
         entries, creds = [], []
-        for path in connection.spider(sysvol, pattern=["GptTmpl.inf", "Groups.xml", "Services.xml", "ScheduledTasks.xml"]):
-            data = self._read_file(context, connection, sysvol, path)
-            if not data:
-                continue
-            if path.lower().endswith(".inf"):
-                self._collect_gpttmpl(self._guid_label(path),
-                                      self._split_ini(data.decode("utf-16", errors="ignore")), entries)
-            else:
-                self._collect_gpp(context, self._guid_label(path), path, data, entries, creds)
+        for share in shares:
+            for path in dict.fromkeys(connection.spider(share, pattern=self.SPIDER_PATTERNS, silent=True)):
+                data = self._read_file(context, connection, share, path)
+                if not data:
+                    continue
+                low = path.lower()
+                label = self._guid_label(path)
+                if low.endswith(".inf"):
+                    self._collect_gpttmpl(label, self._split_ini(self._decode(data)), entries)
+                elif low.endswith("scripts.ini"):
+                    self._collect_scripts_ini(label, self._split_ini(self._decode(data)), entries)
+                elif low.endswith("registry.xml"):
+                    self._collect_registry_xml(context, label, data, entries, creds)
+                elif low.endswith(".xml"):
+                    self._collect_gpp(context, label, path, data, entries, creds)
+                else:
+                    self._scan_script(label, path, data, entries)
 
         if not entries:
             context.log.display("No security settings found in any GPO")
             return
+
+        # Resolve GPP Groups.xml names->SIDs and finalize their hotness before display, so the
+        # SIDs they contribute are included in the display-resolution batch below.
+        self._resolve_gpp_groups(context, connection, entries)
 
         all_sids = {sid for e in entries for sid, _ in e["cells"] if sid.startswith("S-1-")}
         sid_map = self._resolve_sids(context, connection, all_sids)
