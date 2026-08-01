@@ -133,15 +133,6 @@ _SCRIPT_IDX = re.compile(r"(\d+)(CmdLine|Parameters)$", re.IGNORECASE)
 HOT_ALL = "ALL"
 
 
-def _to_int(value):
-    """Parse a REG_DWORD-ish string ('1', '0x00000001') to int, or None."""
-    value = (value or "").strip()
-    try:
-        return int(value, 16) if value.lower().startswith("0x") else int(value)
-    except ValueError:
-        return None
-
-
 # GPP Registry.xml checks: (key substring, value name, predicate(str)->bool, message).
 # Curated to the highest-value cleartext-cred / privesc / auth-downgrade policy.
 _REG_CHECKS = [
@@ -194,7 +185,8 @@ class NXCModule:
 
     def _anomalous_principal(self, sid, broad=False):
         """A principal that is anomalous in a sensitive slot: a specific domain account
-        (RID>=1000), or - with broad=True - a broad low-priv group (Everyone, Auth Users, ...)."""
+        (RID>=1000), or - with broad=True - a broad low-priv group (Everyone, Auth Users, ...).
+        """
         return bool(self._domain_rid(sid)) or (broad and self._is_broad_lowpriv(sid))
 
     # --- primitives ----------------------------------------------------------------
@@ -506,7 +498,7 @@ class NXCModule:
                 e["hot"] = {e["cells"][0][0]}
 
     def _lsa_open(self, context, connection):
-        """Open \\lsarpc + an LSA policy handle. Returns (dce, policy) or (None, None)."""
+        r"""Open \lsarpc + an LSA policy handle. Returns (dce, policy) or (None, None)."""
         try:
             rpctransport = transport.SMBTransport(connection.host, 445, r"\lsarpc", smb_connection=connection.conn)
             dce = rpctransport.get_dce_rpc()
@@ -582,12 +574,19 @@ class NXCModule:
 
     def _ldap_lookup(self, context, connection, sids):
         out = {}
+        # This is an SMB module, so there is no connection.baseDN to reuse - derive it from the
+        # domain. Without it impacket defaults to baseDN="" and every search silently matches
+        # nothing. The URL uses remoteName (not the IP) so the Kerberos SPN resolves.
+        base_dn = ",".join(f"DC={part}" for part in connection.domain.split(".") if part)
+        if not base_dn:
+            context.log.debug("No domain on the connection - skipping the LDAP name fallback")
+            return out
         try:
-            ldapc = ldap_impacket.LDAPConnection(url=f"ldap://{connection.host}", dstIp=connection.host)
-            if getattr(connection, "kerberos", False):
+            ldapc = ldap_impacket.LDAPConnection(url=f"ldap://{connection.remoteName}", baseDN=base_dn, dstIp=connection.host)
+            if connection.kerberos:
                 ldapc.kerberosLogin(connection.username, connection.password or "", connection.domain,
                                     connection.lmhash, connection.nthash, connection.aesKey or "",
-                                    kdcHost=connection.kdcHost, useCache=bool(getattr(connection, "use_kcache", False)))
+                                    kdcHost=connection.kdcHost, useCache=bool(connection.use_kcache))
             else:
                 ldapc.login(user=connection.username, password=connection.password or "",
                             domain=connection.domain, lmhash=connection.lmhash, nthash=connection.nthash)
@@ -610,8 +609,12 @@ class NXCModule:
         # highlight() wraps its argument in bold yellow, but each segment below sets its
         # own red/white color which overrides that (last color wins). highlight is the
         # only prefix-less, file-logged emitter nxc exposes.
-        red = lambda s: colored(s, "red", attrs=["bold"])
-        white = lambda s: colored(s, "white")
+        def red(s):
+            return colored(s, "red", attrs=["bold"])
+
+        def white(s):
+            return colored(s, "white")
+
         if hot == HOT_ALL:
             rendered = ", ".join(disp(sid) + suf for sid, suf in cells)
             context.log.highlight(red(f"        {tmpl.replace('{P}', rendered)}"))
@@ -635,10 +638,7 @@ class NXCModule:
     ]
 
     def on_login(self, context, connection):
-        shares = []
-        for share in connection.shares():
-            if share["name"].lower() in ("sysvol", "netlogon") and "READ" in share["access"]:
-                shares.append(share["name"])
+        shares = [s["name"] for s in connection.shares() if s["name"].lower() in ("sysvol", "netlogon") and "READ" in s["access"]]
         if not shares:
             context.log.fail("No readable SYSVOL/NETLOGON share - cannot audit GPOs")
             return
@@ -695,3 +695,12 @@ class NXCModule:
                 context.log.display(f"  {section}")
                 for e in (x for x in pol_entries if x["section"] == section):
                     self._emit(context, e["tmpl"], e["cells"], e["hot"], disp)
+
+
+def _to_int(value):
+    """Parse a REG_DWORD-ish string ('1', '0x00000001') to int, or None."""
+    value = (value or "").strip()
+    try:
+        return int(value, 16) if value.lower().startswith("0x") else int(value)
+    except ValueError:
+        return None

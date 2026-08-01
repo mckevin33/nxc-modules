@@ -1,6 +1,6 @@
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldaptypes
-from impacket.ldap.ldapasn1 import Control, SDFlagsControl
+from impacket.ldap.ldapasn1 import Control, SDFlagsControl, SimplePagedResultsControl
 from impacket.uuid import bin_to_string
 from nxc.modules.daclread import WELL_KNOWN_SIDS
 from nxc.parsers.ldap_results import parse_result_attributes, sid_to_str
@@ -38,14 +38,6 @@ TOMBSTONE_ATTRIBUTES = [
 ]
 
 
-def show_deleted_control():
-    """LDAP_SERVER_SHOW_DELETED - makes the DC return and accept writes on tombstones."""
-    control = Control()
-    control["controlType"] = SHOW_DELETED_OID
-    control["criticality"] = True
-    return control
-
-
 class NXCModule:
     """Module by Fabrizzio: @Fabrizzio53
 
@@ -77,40 +69,27 @@ class NXCModule:
         """
         self.action = module_options.get("ACTION", "query")
         self.id = module_options.get("ID", "")
-        self.deleteDN = module_options.get("DN", "")
+        self.delete_dn = module_options.get("DN", "")
 
         self.ready = True
         if self.action == "restore" and not self.id:
             context.log.fail("ID is required for the restore action")
             self.ready = False
-        if self.action == "delete" and not self.deleteDN:
+        if self.action == "delete" and not self.delete_dn:
             context.log.fail("DN is required for the delete action")
             self.ready = False
 
     def _deleted_objects_dn(self):
         return "CN=Deleted Objects," + self.__base_dn
 
-    def _search_deleted(self, context, connection, search_filter="(isDeleted=TRUE)", attributes=None):
-        """Return the matching tombstones (excluding the container itself), or None on error."""
+    def _search_deleted(self, connection, search_filter="(isDeleted=TRUE)", attributes=None):
+        """Return the matching tombstones (excluding the container itself)."""
         base = self._deleted_objects_dn()
-
-        try:
-            context.log.debug(f"Search Filter={search_filter}")
-            resp = connection.ldap_connection.search(
-                base,
-                2,  # subtree
-                searchFilter=search_filter,
-                attributes=attributes or TOMBSTONE_ATTRIBUTES,
-                sizeLimit=0,
-                searchControls=[show_deleted_control()],
-            )
-        except ldap_impacket.LDAPSearchError as e:
-            if "sizeLimitExceeded" in e.getErrorString():
-                context.log.debug("sizeLimitExceeded, processing the results received so far")
-                resp = e.getAnswers()
-            else:
-                context.log.debug(e)
-                return None
+        # connection.search() only adds its own paged-results control when searchControls is
+        # empty, so paging has to be passed explicitly next to SHOW_DELETED - otherwise the DC
+        # caps the answer at 1000 tombstones. Error handling and logging live in that function.
+        controls = [show_deleted_control(), SimplePagedResultsControl(criticality=True, size=1000)]
+        resp = connection.search(search_filter, attributes or TOMBSTONE_ATTRIBUTES, baseDN=base, searchControls=controls)
 
         objects = []
         for obj in parse_result_attributes(resp):
@@ -121,21 +100,17 @@ class NXCModule:
             objects.append(obj)
         return objects
 
-    def _find_by_guid(self, context, connection, attributes=None):
-        """Return the tombstone whose objectGUID is self.id, or None.
+    def _find_by_guid(self, connection, attributes=None):
+        r"""Return the tombstone whose objectGUID is self.id, or None.
 
-        Matched on the "OldName\\x0ADEL:<guid>" suffix AD stamps onto a deleted object's
+        Matched on the "OldName\x0ADEL:<guid>" suffix AD stamps onto a deleted object's
         `name` rather than on objectGUID, because neither GUID route works here: impacket's
         filter parser UTF-8-expands escaped bytes >= 0x80, so a server-side (objectGUID=...)
         filter never matches, and comparing client-side fails too because nxc's
         parse_result_attributes decodes objectGUID with UUID(bytes=...) instead of
         UUID(bytes_le=...), byte-swapping its first three fields.
         """
-        objects = self._search_deleted(
-            context, connection,
-            search_filter=f"(&(isDeleted=TRUE)(name=*DEL:{self.id}))",
-            attributes=attributes,
-        )
+        objects = self._search_deleted(connection, search_filter=f"(&(isDeleted=TRUE)(name=*DEL:{self.id}))", attributes=attributes)
         return objects[0] if objects else None
 
     def _print_object(self, context, obj):
@@ -155,7 +130,7 @@ class NXCModule:
         self.analyze_reanimate_rights(context, connection)
 
     def query_deleted_objects(self, context, connection):
-        objects = self._search_deleted(context, connection)
+        objects = self._search_deleted(connection)
         if not objects:
             context.log.fail("No deleted objects found (AD Recycle Bin may be disabled).")
             return
@@ -165,21 +140,12 @@ class NXCModule:
         for obj in objects:
             self._print_object(context, obj)
 
-    def _resolve_sid(self, context, connection, sid):
+    def _resolve_sid(self, connection, sid):
         """Resolve a SID to a readable name (well-known map first, then LDAP objectSid lookup)."""
         if sid in WELL_KNOWN_SIDS:
             return WELL_KNOWN_SIDS[sid]
-        try:
-            resp = connection.ldap_connection.search(
-                searchFilter=f"(objectSid={sid})",
-                attributes=["sAMAccountName"],
-            )
-            parsed = parse_result_attributes(resp)
-            if parsed and parsed[0].get("sAMAccountName"):
-                return parsed[0]["sAMAccountName"]
-        except Exception as e:
-            context.log.debug(f"Could not resolve SID {sid}: {e}")
-        return ""
+        parsed = parse_result_attributes(connection.search(f"(objectSid={sid})", ["sAMAccountName"]))
+        return parsed[0]["sAMAccountName"] if parsed and parsed[0].get("sAMAccountName") else ""
 
     def _ace_grants_reanimate(self, ace):
         """Return the trustee SID if this ACE grants the Reanimate-Tombstones right, else None.
@@ -210,6 +176,9 @@ class NXCModule:
     def analyze_reanimate_rights(self, context, connection):
         context.log.display(f"Reading DACL of domain root {self.__base_dn} to find who can reanimate tombstones")
 
+        # The only search here that cannot go through connection.search(): that helper takes its
+        # scope from the connection (subtree), and reading just the domain root's own DACL needs
+        # a baseObject scope - a subtree search from the root would pull the whole domain.
         try:
             resp = connection.ldap_connection.search(
                 self.__base_dn,
@@ -245,13 +214,13 @@ class NXCModule:
         context.log.display(f"{len(sids)} principal(s) can reanimate deleted objects:")
         context.log.highlight("")
         for sid in sorted(sids):
-            name = self._resolve_sid(context, connection, sid)
+            name = self._resolve_sid(connection, sid)
             context.log.highlight(f"{name or 'UNKNOWN'}    ({sid})")
 
     def restore_deleted_object(self, context, connection):
         context.log.display(f"Searching for deleted object with ID {self.id}")
 
-        target = self._find_by_guid(context, connection, [*TOMBSTONE_ATTRIBUTES, "msDS-LastKnownRDN"])
+        target = self._find_by_guid(connection, [*TOMBSTONE_ATTRIBUTES, "msDS-LastKnownRDN"])
         if target is None:
             context.log.fail(f"No deleted object found with ID {self.id}")
             return
@@ -292,21 +261,21 @@ class NXCModule:
 
         # A DC can accept the modify but apply only the rename, leaving the object tombstoned,
         # so report success only once it is gone from the Deleted Objects container.
-        if self._find_by_guid(context, connection, ["isDeleted"]) is not None:
+        if self._find_by_guid(connection, ["isDeleted"]) is not None:
             context.log.fail("Restore did not take effect - object is still a tombstone.")
             context.log.fail("This DC did not honor the single-modify reanimation; a ModifyDN-based tool such as bloodyAD's 'set restore' may be needed.")
             return
         context.log.success(f'Restored "{restored_dn}"')
 
     def delete_object(self, context, connection):
-        context.log.display(f"Deleting {self.deleteDN}")
+        context.log.display(f"Deleting {self.delete_dn}")
 
         try:
-            connection.ldap_connection.delete(self.deleteDN, controls=[show_deleted_control()])
+            connection.ldap_connection.delete(self.delete_dn, controls=[show_deleted_control()])
         except ldap_impacket.LDAPSessionError as e:
-            context.log.fail(f'Failed to delete "{self.deleteDN}": {e}')
+            context.log.fail(f'Failed to delete "{self.delete_dn}": {e}')
             return
-        context.log.success(f'Deleted "{self.deleteDN}"')
+        context.log.success(f'Deleted "{self.delete_dn}"')
 
     def on_login(self, context, connection):
         if not self.ready:
@@ -323,3 +292,11 @@ class NXCModule:
             context.log.fail(f'Unknown action "{self.action}" (use query, restore or delete)')
             return
         handler(context, connection)
+
+
+def show_deleted_control():
+    """LDAP_SERVER_SHOW_DELETED - makes the DC return and accept writes on tombstones."""
+    control = Control()
+    control["controlType"] = SHOW_DELETED_OID
+    control["criticality"] = True
+    return control

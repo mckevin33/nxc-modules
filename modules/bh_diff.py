@@ -17,13 +17,8 @@ import shutil
 import zipfile
 from datetime import datetime
 
-try:
-    from nxc.helpers.misc import CATEGORY
-    from nxc.paths import NXC_PATH
-except ImportError:  # unit tests run under plain python3, without the nxc venv
-    class CATEGORY:
-        ENUMERATION = "Enumeration"
-    NXC_PATH = os.path.join(os.path.expanduser("~"), ".nxc")
+from nxc.helpers.misc import CATEGORY
+from nxc.paths import NXC_PATH
 
 
 # Fields that identify an ACE. The rest (InheritanceHash, IsPermissionForOwnerRightsSid...)
@@ -38,6 +33,123 @@ SKIP_KEYS = {"Properties", "Aces", "ObjectIdentifier"}
 # etc. have the shape {Collected, FailureReason, Results}). A change on it is a PERMISSION
 # difference, not time drift - so render flags it with a distinct marker.
 DENIAL_KEY = "Collected"
+
+
+class NXCModule:
+    """Differential BloodHound collection across two accounts.
+
+    Module by Michal Stepniewski
+    """
+
+    name = "bh_diff"
+    description = "Collect BloodHound as the current account and show what it sees that a prior account did not"
+    supported_protocols = ["ldap"]
+    category = CATEGORY.ENUMERATION
+
+    def options(self, context, module_options):
+        """
+        BASELINE  Path to the reference zip (account #1). Default: the newest set from a
+                  different user in ~/.nxc/modules/bh_diff/<DOMAIN>/
+        CURRENT   Path to a zip to compare instead of collecting live.
+                  BASELINE + CURRENT = a pure offline diff, no network traffic.
+        COLLECT   Collection methods passed to nxc's built-in collector. Default: All.
+                  DCOnly gives a deterministic, pure-LDAP diff (no sessions).
+        FORCE     Compare even when the two sets are from different domains. Use: FORCE=true
+        """
+        self.baseline = module_options.get("BASELINE")
+        self.current = module_options.get("CURRENT")
+        self.collect = module_options.get("COLLECT", "All")
+        self.force = module_options.get("FORCE", "").lower() in ("true", "1", "yes")
+
+    def _collect(self, context, connection):
+        """Drive nxc's built-in collector (the same code as `nxc ldap --bloodhound`)."""
+        produced = f"{connection.output_filename}_bloodhound.zip"
+        prev = connection.args.collection
+        connection.args.collection = self.collect
+        try:
+            connection.bloodhound()
+        # BloodHound.connect() calls sys.exit(1) when it cannot find a DC - without
+        # SystemExit in this tuple the whole nxc would die instead of just this module.
+        except (Exception, SystemExit) as e:
+            context.log.fail(f"BloodHound collection failed: {e.__class__.__name__} - {e}")
+            context.log.fail("If this is 'Could not find a domain controller', add --dns-server <DC IP>")
+            return None
+        finally:
+            connection.args.collection = prev
+
+        # connection.bloodhound() returns nothing - judge success by whether the file exists.
+        if not os.path.exists(produced):
+            context.log.fail(f"Collector produced no zip: {produced}")
+            return None
+        return produced
+
+    def on_login(self, context, connection):
+        domain = (connection.domain or "").upper()
+        user = connection.username or "unknown"
+
+        if self.baseline and self.current:
+            context.log.display("Offline mode: comparing the given zips, no collection")
+            b_path = self.current
+        elif self.current:
+            b_path = self.current
+            context.log.display(f"Using the given set as current: {b_path}")
+        else:
+            produced = self._collect(context, connection)
+            if not produced:
+                return
+            b_path = os.path.join(store_dir(domain), store_name(user, datetime.now()))
+            shutil.move(produced, b_path)
+            context.log.success(f"Set saved: {b_path}")
+
+        a_path = self.baseline or pick_baseline(store_dir(domain), user)
+        if not a_path:
+            context.log.display("No set from another account in this domain - baseline saved.")
+            context.log.display("Run again from a second account to see the difference.")
+            return
+        if not self.current:
+            context.log.display(f"Baseline: {a_path}")
+
+        for path in (a_path, b_path):
+            if not os.path.isfile(path):
+                context.log.fail(f"No such file: {path}")
+                return
+
+        try:
+            a, a_errors = load_zip(a_path)
+            b, b_errors = load_zip(b_path)
+        except zipfile.BadZipFile as e:
+            context.log.fail(f"Corrupt zip: {e}")
+            return
+
+        for side, errors in (("A", a_errors), ("B", b_errors)):
+            if errors:
+                context.log.fail(f"{side}: skipped unparseable entries: {', '.join(errors)}")
+
+        a_dom, b_dom = zip_domain(a), zip_domain(b)
+        if a_dom and b_dom and a_dom != b_dom and not self.force:
+            context.log.fail(f"Different domains: A={a_dom}, B={b_dom}. Use FORCE=true to compare anyway.")
+            return
+
+        only_a_kinds, only_b_kinds = scope_diff(a, b)
+        if only_a_kinds or only_b_kinds:
+            context.log.fail("Sets collected with a DIFFERENT scope - some differences come "
+                             "from scope, not from permissions")
+            if only_a_kinds:
+                context.log.fail(f"  types only in A: {', '.join(only_a_kinds)}")
+            if only_b_kinds:
+                context.log.fail(f"  types only in B: {', '.join(only_b_kinds)}")
+
+        if user_of(a_path) == user_of(b_path):
+            context.log.fail("Both sets are from the same account - the diff measures time drift, not permissions")
+
+        context.log.highlight(f"=== bh_diff: {b_dom or domain} ===")
+        context.log.highlight(f"A (baseline): {os.path.basename(a_path)}")
+        context.log.highlight(f"B (current) : {os.path.basename(b_path)}")
+
+        diff = diff_sets(a, b)
+        for line in render(diff, a, b):
+            context.log.highlight(line)
+        context.log.highlight(f"=== summary === {summary_line(diff)}")
 
 
 def obj_label(obj):
@@ -266,10 +378,8 @@ def _value_lines(label, sub, names, denial=False):
                        f"- this is a PERMISSION difference, not time drift")
         else:
             out.append(f"        {pad} [ ~] {_canon(old)} -> {_canon(new)}")
-    for item in sub.get("only_b") or []:
-        out.append(f"        {pad} [+B] {_item_str(item, names)}")
-    for item in sub.get("only_a") or []:
-        out.append(f"        {pad} [-A] {_item_str(item, names)}")
+    out.extend(f"        {pad} [+B] {_item_str(item, names)}" for item in sub.get("only_b") or [])
+    out.extend(f"        {pad} [-A] {_item_str(item, names)}" for item in sub.get("only_a") or [])
     return out
 
 
@@ -310,10 +420,8 @@ def render(diff, a_data, b_data):
         entry = diff[kind]
         lines.append(f"--- {kind}  (+B {len(entry['only_b'])}  "
                      f"-A {len(entry['only_a'])}  ~ {len(entry['changed'])}) ---")
-        for oid in entry["only_b"]:
-            lines.append(f"[+B] {_resolve(names, oid)}   {oid}")
-        for oid in entry["only_a"]:
-            lines.append(f"[-A] {_resolve(names, oid)}   {oid}")
+        lines.extend(f"[+B] {_resolve(names, oid)}   {oid}" for oid in entry["only_b"])
+        lines.extend(f"[-A] {_resolve(names, oid)}   {oid}" for oid in entry["only_a"])
         for oid, d in entry["changed"].items():
             lines.append(f"[ ~] {_resolve(names, oid)}   {oid}")
             lines.extend(_object_detail_lines(d, names))
@@ -344,7 +452,7 @@ def user_of(path):
 
 
 def store_dir(domain):
-    path = os.path.join(NXC_PATH, "logs", "bh_diff", safe_name(domain.upper()))
+    path = os.path.join(NXC_PATH, "modules", "bh_diff", safe_name(domain.upper()))
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -358,120 +466,3 @@ def pick_baseline(dirpath, current_user):
         if f.endswith(".zip") and user_of(f) != want
     ]
     return max(candidates, key=os.path.getmtime) if candidates else None
-
-
-class NXCModule:
-    """Differential BloodHound collection across two accounts.
-
-    Module by Michal Stepniewski
-    """
-
-    name = "bh_diff"
-    description = "Collect BloodHound as the current account and show what it sees that a prior account did not"
-    supported_protocols = ["ldap"]
-    category = CATEGORY.ENUMERATION
-
-    def options(self, context, module_options):
-        """
-        BASELINE  Path to the reference zip (account #1). Default: the newest set from a
-                  different user in ~/.nxc/logs/bh_diff/<DOMAIN>/
-        CURRENT   Path to a zip to compare instead of collecting live.
-                  BASELINE + CURRENT = a pure offline diff, no network traffic.
-        COLLECT   Collection methods passed to nxc's built-in collector. Default: All.
-                  DCOnly gives a deterministic, pure-LDAP diff (no sessions).
-        FORCE     Compare even when the two sets are from different domains. Use: FORCE=true
-        """
-        self.baseline = module_options.get("BASELINE")
-        self.current = module_options.get("CURRENT")
-        self.collect = module_options.get("COLLECT", "All")
-        self.force = "FORCE" in module_options
-
-    def _collect(self, context, connection):
-        """Drive nxc's built-in collector (the same code as `nxc ldap --bloodhound`)."""
-        produced = f"{connection.output_filename}_bloodhound.zip"
-        prev = getattr(connection.args, "collection", "Default")
-        connection.args.collection = self.collect
-        try:
-            connection.bloodhound()
-        # BloodHound.connect() calls sys.exit(1) when it cannot find a DC - without
-        # SystemExit in this tuple the whole nxc would die instead of just this module.
-        except (Exception, SystemExit) as e:
-            context.log.fail(f"BloodHound collection failed: {e.__class__.__name__} - {e}")
-            context.log.fail("If this is 'Could not find a domain controller', add --dns-server <DC IP>")
-            return None
-        finally:
-            connection.args.collection = prev
-
-        # connection.bloodhound() returns nothing - judge success by whether the file exists.
-        if not os.path.exists(produced):
-            context.log.fail(f"Collector produced no zip: {produced}")
-            return None
-        return produced
-
-    def on_login(self, context, connection):
-        domain = (connection.domain or "").upper()
-        user = connection.username or "unknown"
-
-        if self.baseline and self.current:
-            context.log.display("Offline mode: comparing the given zips, no collection")
-            b_path = self.current
-        elif self.current:
-            b_path = self.current
-            context.log.display(f"Using the given set as current: {b_path}")
-        else:
-            produced = self._collect(context, connection)
-            if not produced:
-                return
-            b_path = os.path.join(store_dir(domain), store_name(user, datetime.now()))
-            shutil.move(produced, b_path)
-            context.log.success(f"Set saved: {b_path}")
-
-        a_path = self.baseline or pick_baseline(store_dir(domain), user)
-        if not a_path:
-            context.log.display("No set from another account in this domain - baseline saved.")
-            context.log.display("Run again from a second account to see the difference.")
-            return
-        if not self.current:
-            context.log.display(f"Baseline: {a_path}")
-
-        for path in (a_path, b_path):
-            if not os.path.isfile(path):
-                context.log.fail(f"No such file: {path}")
-                return
-
-        try:
-            a, a_errors = load_zip(a_path)
-            b, b_errors = load_zip(b_path)
-        except zipfile.BadZipFile as e:
-            context.log.fail(f"Corrupt zip: {e}")
-            return
-
-        for side, errors in (("A", a_errors), ("B", b_errors)):
-            if errors:
-                context.log.fail(f"{side}: skipped unparseable entries: {', '.join(errors)}")
-
-        a_dom, b_dom = zip_domain(a), zip_domain(b)
-        if a_dom and b_dom and a_dom != b_dom and not self.force:
-            context.log.fail(f"Different domains: A={a_dom}, B={b_dom}. Use FORCE=true to compare anyway.")
-            return
-
-        only_a_kinds, only_b_kinds = scope_diff(a, b)
-        if only_a_kinds or only_b_kinds:
-            context.log.fail("Sets collected with a DIFFERENT scope - some differences come "
-                             "from scope, not from permissions")
-            if only_a_kinds:
-                context.log.fail(f"  types only in A: {', '.join(only_a_kinds)}")
-            if only_b_kinds:
-                context.log.fail(f"  types only in B: {', '.join(only_b_kinds)}")
-
-        if user_of(a_path) == user_of(b_path):
-            context.log.fail("Both sets are from the same account - the diff measures time drift, not permissions")
-
-        context.log.highlight(f"=== bh_diff: {b_dom or domain} ===")
-        context.log.highlight(f"A (baseline): {os.path.basename(a_path)}")
-        context.log.highlight(f"B (current) : {os.path.basename(b_path)}")
-
-        diff = diff_sets(a, b)
-        for line in render(diff, a, b):
-            context.log.highlight(line)
-        context.log.highlight(f"=== summary === {summary_line(diff)}")

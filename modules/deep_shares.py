@@ -25,6 +25,8 @@ from impacket.smb3structs import (
 from impacket.ldap.ldaptypes import (
     SR_SECURITY_DESCRIPTOR, ACE, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_OBJECT_ACE,
 )
+from impacket.dcerpc.v5 import lsad, lsat, srvs, transport
+from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
 from impacket.dcerpc.v5.srvs import STYPE_MASK, STYPE_DISKTREE, STYPE_SPECIAL
 from nxc.helpers.misc import CATEGORY
 
@@ -38,7 +40,7 @@ ACCESS_ALLOWED_TYPES = (ACCESS_ALLOWED_ACE.ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE.A
 WRITE_MASK_ANY = (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | DELETE
                   | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)
 
-MAX_DEPTH = 5                # recursion cap below each share root (scope with SHARE, not depth)
+MAX_DEPTH = 5                # default recursion cap below each share root (override with DEPTH)
 LSA_USE_UNRESOLVED = (7, 8)  # SID_NAME_USE: SidTypeInvalid / SidTypeUnknown
 
 # Names for SIDs that are not AD objects (LDAP/LSA won't resolve these).
@@ -59,20 +61,6 @@ ADMIN_SIDS = {"S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-3-0", "S-1-5-9",
 ADMIN_RID_SUFFIXES = ("-512", "-519", "-518", "-516", "-517", "-521", "-498", "-500", "-502")
 
 
-def _iter_allow_aces(sd):
-    """Yield (sid, mask, inherited) for each ALLOWED ACE in a descriptor's DACL. Callers
-    handle the NULL-DACL case themselves (it means different things to each)."""
-    for ace in sd["Dacl"]["Data"]:
-        if ace["AceType"] not in ACCESS_ALLOWED_TYPES:
-            continue
-        try:
-            sid = ace["Ace"]["Sid"].formatCanonical()
-            mask = ace["Ace"]["Mask"]["Mask"]
-        except Exception:
-            continue
-        yield sid, mask, bool(ace["AceFlags"] & INHERITED_ACE)
-
-
 class NXCModule:
     """Environment-wide audit of which principal can write where (from the DACL)."""
 
@@ -91,6 +79,7 @@ class NXCModule:
         FILES       Also inspect file ACLs, not just directories (default: false)
         VERIFY      Keep only paths you can really write, confirmed by a temp-file write (default: false)
         ALL_SHARES  Also scan admin shares C$/ADMIN$/drive letters - huge & slow (default: false)
+        DEPTH       How deep to recurse below each share root (default: 5)
         """
         raw = module_options.get("SIDS")
         self.hunt_sids, self.hunt_names, self.hunt_all = set(), [], False
@@ -108,13 +97,14 @@ class NXCModule:
 
         share = module_options.get("SHARE")
         self.shares_opt = [s.strip() for s in share.split(",") if s.strip()] if share else None
-        self.files = "FILES" in module_options
-        self.verify = "VERIFY" in module_options
-        self.all_shares = "ALL_SHARES" in module_options
+        self.files = module_options.get("FILES", "").lower() in ("true", "1", "yes")
+        self.verify = module_options.get("VERIFY", "").lower() in ("true", "1", "yes")
+        self.all_shares = module_options.get("ALL_SHARES", "").lower() in ("true", "1", "yes")
+        self.depth = int(module_options.get("DEPTH", MAX_DEPTH))
 
     # -------------------------------------------------------------------------------
     def on_login(self, context, connection):
-        self.host = getattr(connection, "host", "") or ""
+        self.host = connection.host
         self.conn = connection
         self._names = {}
         self._rpc_setup(context)
@@ -194,7 +184,7 @@ class NXCModule:
         # parent_writers = SIDs an ancestor already grants write to; used to collapse
         # subdirectories that merely inherit that grant, so the table stays readable.
         writers = self._report_object(context, base, rows, parent_writers, is_dir=True)
-        if depth >= MAX_DEPTH:
+        if depth >= self.depth:
             return
         try:
             entries = self.conn.conn.listPath(self.share, (base + "\\*") if base else "*")
@@ -215,7 +205,8 @@ class NXCModule:
 
     def _report_object(self, context, path, rows, parent_writers, is_dir=True):
         """Append a row for each hunted principal that has write here. Returns the set of
-        write-granted SIDs on this object (union with ancestors, for collapse)."""
+        write-granted SIDs on this object (union with ancestors, for collapse).
+        """
         grants = self._write_grants(context, path, is_dir)
         if grants is None:
             return parent_writers
@@ -239,7 +230,8 @@ class NXCModule:
         """VERIFY mode: keep only rows on directories the CURRENT user can really write
         (create + delete a temp file). Removes share-capped false positives (e.g.
         NETLOGON). Confirms YOUR access, not the listed principal's - the only thing
-        checkable over SMB without being them."""
+        checkable over SMB without being them.
+        """
         cache, kept = {}, []
         for r in rows:
             if not r.get("is_dir", True):
@@ -268,7 +260,8 @@ class NXCModule:
 
     def _write_grants(self, context, path, is_dir):
         """Return {sid: {mask, explicit}} for hunted principals that have write here,
-        or None on read failure."""
+        or None on read failure.
+        """
         try:
             sd = self._read_dacl(path, is_dir)
         except Exception as e:
@@ -288,7 +281,8 @@ class NXCModule:
 
     def _read_dacl(self, path, is_dir):
         """create(READ_CONTROL) -> queryInfo(SECURITY, OWNER|GROUP|DACL) -> parse. This is
-        the only way to read a file/dir security descriptor over SMB (no high-level nxc API)."""
+        the only way to read a file/dir security descriptor over SMB (no high-level nxc API).
+        """
         opts = FILE_DIRECTORY_FILE if is_dir else FILE_NON_DIRECTORY_FILE
         # SMB3.create arg order: desiredAccess, shareMode, creationOptions,
         # creationDisposition, fileAttributes - pass by keyword to stay correct.
@@ -312,15 +306,14 @@ class NXCModule:
             return sid in self.hunt
         if not self.hunt_all:
             return False
-        # 'all' mode: skip expected/privileged holders to cut noise (hunt their SID to include).
-        if sid in ADMIN_SIDS or any(sid.endswith(x) for x in ADMIN_RID_SUFFIXES):
-            return False
-        return True
+        # "all" mode: skip expected/privileged holders to cut noise (hunt their SID to include).
+        return not (sid in ADMIN_SIDS or any(sid.endswith(x) for x in ADMIN_RID_SUFFIXES))
 
     @staticmethod
     def _share_allows_write(share_acl, sid):
         """Does the SHARE-level ACL grant this principal write? Direct grant, or via a
-        broad group it is (almost certainly) a member of (Everyone/Auth Users/Users/Domain Users)."""
+        broad group it is (almost certainly) a member of (Everyone/Auth Users/Users/Domain Users).
+        """
         if share_acl.get(sid, 0) & WRITE_MASK_ANY:
             return True
         for s, m in share_acl.items():
@@ -376,9 +369,7 @@ class NXCModule:
     def _dce_connect(self, context, pipe, uuid):
         """Bind a DCE/RPC pipe over the existing SMB session; None if it fails."""
         try:
-            from impacket.dcerpc.v5 import transport
-            rpc = transport.SMBTransport(self.host, getattr(self.conn, "port", 445) or 445,
-                                         pipe, smb_connection=self.conn.conn)
+            rpc = transport.SMBTransport(self.host, self.conn.port, pipe, smb_connection=self.conn.conn)
             dce = rpc.get_dce_rpc()
             dce.connect()
             dce.bind(uuid)
@@ -389,11 +380,6 @@ class NXCModule:
 
     def _rpc_setup(self, context):
         self._lsa_dce = self._lsa_policy = self._srvsvc_dce = None
-        try:
-            from impacket.dcerpc.v5 import lsat, lsad, srvs
-            from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
-        except Exception:
-            return
         lsa = self._dce_connect(context, r"\lsarpc", lsat.MSRPC_UUID_LSAT)
         if lsa is not None:
             try:
@@ -414,11 +400,11 @@ class NXCModule:
 
     def _read_share_acl(self, context, share):
         """Share-level DACL as {sid: mask} via srvsvc NetrShareGetInfo(502); None if
-        unreadable (admin-gated)."""
+        unreadable (admin-gated).
+        """
         if self._srvsvc_dce is None:
             return None
         try:
-            from impacket.dcerpc.v5 import srvs
             resp = srvs.hNetrShareGetInfo(self._srvsvc_dce, share + "\x00", 502)
             raw = resp["InfoStruct"]["ShareInfo502"]["shi502_security_descriptor"]
             raw = b"".join(raw) if raw else b""
@@ -458,7 +444,6 @@ class NXCModule:
         if self._lsa_dce is None:
             return None
         try:
-            from impacket.dcerpc.v5 import lsat
             r = lsat.hLsarLookupNames(self._lsa_dce, self._lsa_policy, [name])
             t = r["TranslatedSids"]["Sids"][0]
             if t["Use"] in LSA_USE_UNRESOLVED:
@@ -470,7 +455,6 @@ class NXCModule:
 
     def _lsa_name(self, context, sid):
         try:
-            from impacket.dcerpc.v5 import lsat
             r = lsat.hLsarLookupSids(self._lsa_dce, self._lsa_policy, [sid],
                                      lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta)
             tn = r["TranslatedNames"]["Names"][0]
@@ -489,3 +473,15 @@ class NXCModule:
             return str(s[0] if isinstance(s, tuple) else s) or exc.__class__.__name__
         except Exception:
             return str(exc) or exc.__class__.__name__
+
+
+def _iter_allow_aces(sd):
+    """Yield (sid, mask, inherited) for each ALLOWED ACE in a descriptor's DACL. Callers
+    handle the NULL-DACL case themselves (it means different things to each).
+    """
+    for ace in sd["Dacl"]["Data"]:
+        if ace["AceType"] not in ACCESS_ALLOWED_TYPES:
+            continue
+        # Sid and Mask are always populated on these ACE types, so nothing is caught here; a
+        # malformed descriptor propagates to the caller that read it, which debug-logs it.
+        yield ace["Ace"]["Sid"].formatCanonical(), ace["Ace"]["Mask"]["Mask"], bool(ace["AceFlags"] & INHERITED_ACE)

@@ -55,6 +55,78 @@ ENC_TYPE_NAMES = {
 WEAK_ENC_NAMES = {"DES_CBC_CRC", "DES_CBC_MD5", "RC4_HMAC"}
 
 
+class NXCModule:
+    """Analyze AD trust security posture (SID filtering, TGT delegation, transitivity). Ported from @0xcsandker Enum-ADTrusts.ps1"""
+
+    name = "trust_enum"
+    description = "Enumerate AD trusts and interpret their security posture (SID filtering, TGT delegation, transitivity)"
+    supported_protocols = ["ldap"]
+    category = CATEGORY.ENUMERATION
+
+    def options(self, context, module_options):
+        """
+        Enumerate AD trusts and interpret their security posture. No options.
+
+        Usage:
+            nxc ldap $DC -u user -p pass -M trust_enum
+        """
+
+    def on_login(self, context, connection):
+        # Use the queried DC's own naming context, not the -d flag: reading a
+        # partner DC cross-forest would otherwise mislabel whose trusts these are.
+        local_domain = dn_to_domain(connection.baseDN) or connection.domain or ""
+        context.log.display(f"Enumerating trusts of {local_domain or connection.host}...")
+
+        # connection.search() logs its own failure and returns [], so no error handling here.
+        resp = connection.search("(objectClass=trustedDomain)", ["trustPartner", "flatName", "trustDirection", "trustType", "trustAttributes", "msDS-SupportedEncryptionTypes"])
+
+        trusts = parse_result_attributes(resp)
+        if not trusts:
+            context.log.display("No trust relationships found.")
+            return
+
+        context.log.success(f"Found {len(trusts)} trust relationship(s)")
+
+        for trust in trusts:
+            try:
+                partner = trust.get("trustPartner") or trust.get("flatName", "?")
+                attrs = int(trust.get("trustAttributes", 0))
+                direction = int(trust.get("trustDirection", 0))
+                trust_type = int(trust.get("trustType", 0))
+            except (ValueError, TypeError) as e:
+                context.log.fail(f"Could not parse trust entry {trust}: {e}")
+                continue
+
+            flavor = get_trust_flavor(trust_type, attrs)
+            trans_status = get_transitivity(attrs)
+            auth_status = get_authentication_level(attrs)
+            tgt_status, tgt_alert = get_tgt_delegation(attrs)
+            sidf_status, sidf_alert = get_sid_filtering(attrs, trust_type, partner)
+
+            flag_names = decode_flags(attrs, TRUST_ATTRIBUTE_NAMES) or ["<none>"]
+            enc_val = trust.get("msDS-SupportedEncryptionTypes")
+            enc_names = decode_flags(int(enc_val), ENC_TYPE_NAMES) if enc_val else []
+            enc_weak = any(n in WEAK_ENC_NAMES for n in enc_names)
+
+            context.log.highlight(f"=== {local_domain} <-> {partner} ===")
+            self._row(context, "Direction", DIRECTION_NAMES.get(direction, str(direction)))
+            self._row(context, "Type", TRUST_TYPE_NAMES.get(trust_type, str(trust_type)))
+            self._row(context, "Flavor", flavor)
+            self._row(context, "Transitivity", trans_status)
+            self._row(context, "SID Filtering", sidf_status, alert=sidf_alert)
+            self._row(context, "TGT Delegation", tgt_status, alert=tgt_alert)
+            self._row(context, "Auth Level", auth_status)
+            self._row(context, "Attributes", ", ".join(flag_names))
+            self._row(context, "Supported Enc", ", ".join(enc_names) if enc_names else "not set", alert=enc_weak)
+
+    def _row(self, context, label, value, alert=False):
+        # Default color stays as-is (highlight = yellow); security-relevant
+        # deviations from the safe default are switched to red.
+        if alert:
+            value = colored(value, "red")
+        context.log.highlight(f"  {label:<15}: {value}")
+
+
 def decode_flags(value, name_map):
     """Return the list of flag names set in an integer bitmask."""
     return [name for bit, name in name_map.items() if value & bit]
@@ -103,7 +175,8 @@ def get_transitivity(attrs):
 
 def get_tgt_delegation(attrs):
     """Returns (status, alert). alert=True when cross-forest TGT delegation is
-    explicitly enabled - the non-default, attack-relevant state (per [MS-KILE] 3.3.5.7.5)."""
+    explicitly enabled - the non-default, attack-relevant state (per [MS-KILE] 3.3.5.7.5).
+    """
     if attrs & CROSS_ORG_NO_TGT_DELEGATION:
         return "Disabled", False
     if attrs & QUARANTINED_DOMAIN:
@@ -122,7 +195,8 @@ def get_sid_filtering(attrs, trust_type, partner):
     """Returns (status, alert). alert=True when SID filtering is effectively
     disabled on a cross-forest trust - i.e. SID-history injection is viable.
     The intra/forest/external bucket is derived from the trustAttributes flags,
-    not from a display label."""
+    not from a display label.
+    """
     if trust_type in (3, 4):  # MIT/Kerberos or DCE - SID filtering doesn't apply
         return "Unknown", False
     if attrs & WITHIN_FOREST:
@@ -137,82 +211,3 @@ def get_sid_filtering(attrs, trust_type, partner):
         return "Disabled (only specific SIDs filtered)", True
     scope = f"the forest of {partner}" if (attrs & FOREST_TRANSITIVE) else partner
     return f"Enabled (only SIDs from {scope} allowed)", False
-
-
-class NXCModule:
-    """Analyze AD trust security posture (SID filtering, TGT delegation, transitivity). Ported from @0xcsandker Enum-ADTrusts.ps1"""
-
-    name = "trust_enum"
-    description = "Enumerate AD trusts and interpret their security posture (SID filtering, TGT delegation, transitivity)"
-    supported_protocols = ["ldap"]
-    category = CATEGORY.ENUMERATION
-
-    def options(self, context, module_options):
-        """
-        Enumerate AD trusts and interpret their security posture. No options.
-
-        Usage:
-            nxc ldap $DC -u user -p pass -M trust_enum
-        """
-
-    def on_login(self, context, connection):
-        # Use the queried DC's own naming context, not the -d flag: reading a
-        # partner DC cross-forest would otherwise mislabel whose trusts these are.
-        local_domain = dn_to_domain(getattr(connection, "baseDN", "")) or connection.domain or ""
-        context.log.display(f"Enumerating trusts of {local_domain or connection.host}...")
-
-        try:
-            resp = connection.search(
-                "(objectClass=trustedDomain)",
-                ["trustPartner", "flatName", "trustDirection", "trustType",
-                 "trustAttributes", "msDS-SupportedEncryptionTypes"],
-            )
-        except Exception as e:
-            context.log.fail(f"LDAP search for trustedDomain objects failed: {e}")
-            return
-
-        trusts = parse_result_attributes(resp)
-        if not trusts:
-            context.log.display("No trust relationships found.")
-            return
-
-        context.log.success(f"Found {len(trusts)} trust relationship(s)")
-
-        for trust in trusts:
-            try:
-                partner = trust.get("trustPartner") or trust.get("flatName", "?")
-                attrs = int(trust.get("trustAttributes", 0))
-                direction = int(trust.get("trustDirection", 0))
-                trust_type = int(trust.get("trustType", 0))
-            except (ValueError, TypeError) as e:
-                context.log.fail(f"Could not parse trust entry {trust}: {e}")
-                continue
-
-            flavor = get_trust_flavor(trust_type, attrs)
-            trans_status = get_transitivity(attrs)
-            auth_status = get_authentication_level(attrs)
-            tgt_status, tgt_alert = get_tgt_delegation(attrs)
-            sidf_status, sidf_alert = get_sid_filtering(attrs, trust_type, partner)
-
-            flag_names = decode_flags(attrs, TRUST_ATTRIBUTE_NAMES) or ["<none>"]
-            enc_val = trust.get("msDS-SupportedEncryptionTypes")
-            enc_names = decode_flags(int(enc_val), ENC_TYPE_NAMES) if enc_val else []
-            enc_weak = any(n in WEAK_ENC_NAMES for n in enc_names)
-
-            context.log.highlight(f"=== {local_domain} <-> {partner} ===")
-            self._row(context, "Direction", DIRECTION_NAMES.get(direction, str(direction)))
-            self._row(context, "Type", TRUST_TYPE_NAMES.get(trust_type, str(trust_type)))
-            self._row(context, "Flavor", flavor)
-            self._row(context, "Transitivity", trans_status)
-            self._row(context, "SID Filtering", sidf_status, alert=sidf_alert)
-            self._row(context, "TGT Delegation", tgt_status, alert=tgt_alert)
-            self._row(context, "Auth Level", auth_status)
-            self._row(context, "Attributes", ", ".join(flag_names))
-            self._row(context, "Supported Enc", ", ".join(enc_names) if enc_names else "not set", alert=enc_weak)
-
-    def _row(self, context, label, value, alert=False):
-        # Default color stays as-is (highlight = yellow); security-relevant
-        # deviations from the safe default are switched to red.
-        if alert:
-            value = colored(value, "red")
-        context.log.highlight(f"  {label:<15}: {value}")
