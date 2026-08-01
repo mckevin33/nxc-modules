@@ -82,6 +82,7 @@ from impacket.ldap.ldapasn1 import Scope
 
 from nxc.helpers.misc import CATEGORY, gen_random_string
 from nxc.logger import nxc_logger
+from nxc.paths import NXC_PATH
 
 
 TAG = "explicit"
@@ -239,13 +240,16 @@ class NXCModule:
             context.log.display(f"Requesting certificate (template={self.template})")
             pfx_data = request_cert(ca_ip, ca_name, domain, comp_name, comp_hash, dc_ip, atk_ip, target_dns, self.template)
 
-            suffix = gen_random_string(6)
-            pfx_path = os.path.join(context.log_folder_path, f"{target_name.rstrip('$').lower()}_{suffix}.pfx")
+            # Module output belongs in NXC_PATH/modules/<module name>/, not in the logs dir.
+            out_dir = os.path.join(NXC_PATH, "modules", self.name)
+            os.makedirs(out_dir, exist_ok=True)
+            stem = f"{target_name.rstrip('$').lower()}_{gen_random_string(6)}"
+            pfx_path = os.path.join(out_dir, f"{stem}.pfx")
             Path(pfx_path).write_bytes(pfx_data)
             context.log.success(f"Certificate saved: {pfx_path}")
 
             context.log.display(f"PKINIT as {target_name}")
-            ccache_path = os.path.join(context.log_folder_path, f"{target_name.rstrip('$').lower()}_{suffix}.ccache")
+            ccache_path = os.path.join(out_dir, f"{stem}.ccache")
             nt_h, lm_h = pkinit_and_hash(pfx_data, target_name.lower(), domain, dc_ip, ccache_path)
 
             if nt_h:
