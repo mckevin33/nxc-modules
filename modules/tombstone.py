@@ -1,11 +1,7 @@
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldaptypes
 from impacket.ldap.ldapasn1 import Control, SDFlagsControl
-from impacket.examples.utils import init_ldap_session
-from impacket.uuid import bin_to_string, string_to_bin
-from ldap3 import MODIFY_REPLACE, MODIFY_DELETE, SUBTREE
-from ldap3.core.exceptions import LDAPException
-from ldap3.utils.conv import escape_bytes
+from impacket.uuid import bin_to_string
 from nxc.modules.daclread import WELL_KNOWN_SIDS
 from nxc.parsers.ldap_results import parse_result_attributes, sid_to_str
 from nxc.helpers.misc import CATEGORY
@@ -35,9 +31,29 @@ OBJECT_ACE_TYPES = (
     ldaptypes.ACCESS_ALLOWED_CALLBACK_OBJECT_ACE.ACE_TYPE,
 )
 
+# What _print_object displays for every tombstone.
+TOMBSTONE_ATTRIBUTES = [
+    "sAMAccountName", "distinguishedName", "name",
+    "objectSid", "isDeleted", "lastKnownParent", "description",
+]
+
+
+def show_deleted_control():
+    """LDAP_SERVER_SHOW_DELETED - makes the DC return and accept writes on tombstones."""
+    control = Control()
+    control["controlType"] = SHOW_DELETED_OID
+    control["criticality"] = True
+    return control
+
 
 class NXCModule:
-    """Module by Fabrizzio: @Fabrizzio53"""
+    """Module by Fabrizzio: @Fabrizzio53
+
+    Reads and writes go through connection.ldap_connection - the session nxc already
+    authenticated - so they inherit its transport. That matters on a DC enforcing LDAP
+    signing with no TLS certificate, where an ldap3 session cannot bind at all: ldap3
+    does not implement a SASL security layer, and LDAPS is unavailable without a cert.
+    """
 
     name = "tombstone"
     description = "Query, restore, delete and audit reanimation rights of AD Deleted Objects"
@@ -49,7 +65,6 @@ class NXCModule:
         ACTION  Action to run: query (default), restore or delete
         ID      objectGUID of the object to restore (required for ACTION=restore)
         DN      distinguishedName of the object to delete (required for ACTION=delete)
-        SCHEME  ldap or ldaps for restore/delete (default: ldaps)
 
         query    (default) list every tombstone AND the principals that can reanimate them
         restore  reanimate the object with objectGUID=ID
@@ -59,13 +74,10 @@ class NXCModule:
             nxc ldap $DC-IP -u user -p pass -M tombstone
             nxc ldap $DC-IP -u user -p pass -M tombstone -o ACTION=restore ID=5ad162c9-97b1-4a90-a17c-5c2aedb7d1e3
             nxc ldap $DC-IP -u user -p pass -M tombstone -o ACTION=delete DN="CN=test,OU=Users,DC=test,DC=local"
-            nxc ldap $DC-IP -u user -p pass -M tombstone -o ACTION=restore ID=5ad162c9-97b1-4a90-a17c-5c2aedb7d1e3 SCHEME=ldap
         """
         self.action = module_options.get("ACTION", "query")
         self.id = module_options.get("ID", "")
         self.deleteDN = module_options.get("DN", "")
-        # ldaps by default; only fall back to plaintext ldap when explicitly asked
-        self.ssl = module_options.get("SCHEME", "ldaps").lower() != "ldap"
 
         self.ready = True
         if self.action == "restore" and not self.id:
@@ -78,47 +90,19 @@ class NXCModule:
     def _deleted_objects_dn(self):
         return "CN=Deleted Objects," + self.__base_dn
 
-    def _write_session(self, context):
-        """Open an ldap3 session for write actions (restore/delete), or None if it fails."""
-        # If Kerberos is used, the FQDN acts as the KDC host (like impacket's -dc-host).
-        if self.__doKerberos:
-            self.__kdcHost = self.__host
-        try:
-            _, ldap_session = init_ldap_session(
-                self.__domain, self.__username, self.__password, self.__lmhash,
-                self.__nthash, self.__doKerberos, self.__host, self.__kdcHost,
-                self.__aesKey, self.ssl,
-            )
-            return ldap_session
-        except (LDAPException, OSError) as e:
-            # LDAPS is the default, but many DCs (e.g. no TLS cert) reset the connection.
-            # Surface the real error and, on LDAPS, point the user at SCHEME=ldap.
-            if self.ssl:
-                context.log.fail(
-                    f"Could not open an LDAPS write session ({e}). If the DC has no TLS cert, "
-                    "retry with SCHEME=ldap to use plaintext LDAP on port 389."
-                )
-            else:
-                context.log.fail(f"Could not open an LDAP write session: {e}")
-            return None
-
-    def _search_deleted(self, context, connection):
-        """Return the list of tombstoned objects (excluding the container itself), or None on error."""
+    def _search_deleted(self, context, connection, search_filter="(isDeleted=TRUE)", attributes=None):
+        """Return the matching tombstones (excluding the container itself), or None on error."""
         base = self._deleted_objects_dn()
 
-        show_deleted = Control()
-        show_deleted["controlType"] = SHOW_DELETED_OID
-        show_deleted["criticality"] = True
-
         try:
-            context.log.debug("Search Filter=(isDeleted=TRUE)")
+            context.log.debug(f"Search Filter={search_filter}")
             resp = connection.ldap_connection.search(
                 base,
                 2,  # subtree
-                searchFilter="(isDeleted=TRUE)",
-                attributes=["sAMAccountName", "distinguishedName", "name", "objectSid", "isDeleted", "lastKnownParent", "description"],
+                searchFilter=search_filter,
+                attributes=attributes or TOMBSTONE_ATTRIBUTES,
                 sizeLimit=0,
-                searchControls=[show_deleted],
+                searchControls=[show_deleted_control()],
             )
         except ldap_impacket.LDAPSearchError as e:
             if "sizeLimitExceeded" in e.getErrorString():
@@ -137,12 +121,28 @@ class NXCModule:
             objects.append(obj)
         return objects
 
+    def _find_by_guid(self, context, connection, attributes=None):
+        """Return the tombstone whose objectGUID is self.id, or None.
+
+        Matched on the "OldName\\x0ADEL:<guid>" suffix AD stamps onto a deleted object's
+        `name` rather than on objectGUID, because neither GUID route works here: impacket's
+        filter parser UTF-8-expands escaped bytes >= 0x80, so a server-side (objectGUID=...)
+        filter never matches, and comparing client-side fails too because nxc's
+        parse_result_attributes decodes objectGUID with UUID(bytes=...) instead of
+        UUID(bytes_le=...), byte-swapping its first three fields.
+        """
+        objects = self._search_deleted(
+            context, connection,
+            search_filter=f"(&(isDeleted=TRUE)(name=*DEL:{self.id}))",
+            attributes=attributes,
+        )
+        return objects[0] if objects else None
+
     def _print_object(self, context, obj):
         context.log.highlight(f"sAMAccountName    {obj.get('sAMAccountName', '')}")
         context.log.highlight(f"dn                {obj.get('distinguishedName', '')}")
         context.log.highlight(f"ID                {obj.get('name', '').split(':')[-1]}")
-        # sid_to_str formats ldap3's raw objectSid bytes (write path) and passes an already
-        # formatted S-1-... string (impacket read path) through unchanged.
+        # sid_to_str passes an already formatted S-1-... string through unchanged.
         context.log.highlight(f"objectSid         {sid_to_str(obj.get('objectSid', ''))}")
         context.log.highlight(f"isDeleted         {obj.get('isDeleted', '')}")
         context.log.highlight(f"lastKnownParent   {obj.get('lastKnownParent', '')}")
@@ -251,21 +251,10 @@ class NXCModule:
     def restore_deleted_object(self, context, connection):
         context.log.display(f"Searching for deleted object with ID {self.id}")
 
-        ldap_session = self._write_session(context)
-        if ldap_session is None:
-            return
-
-        entries = self._search_deleted_by_guid(
-            ldap_session,
-            ["sAMAccountName", "distinguishedName", "name", "objectSid", "isDeleted", "lastKnownParent", "description", "msDS-LastKnownRDN"],
-        )
-        if not entries:
+        target = self._find_by_guid(context, connection, [*TOMBSTONE_ATTRIBUTES, "msDS-LastKnownRDN"])
+        if target is None:
             context.log.fail(f"No deleted object found with ID {self.id}")
             return
-
-        entry = entries[0]
-        target = {k: (v[0] if v else "") for k, v in entry.entry_attributes_as_dict.items()}
-        target["distinguishedName"] = entry.entry_dn
 
         last_parent = target.get("lastKnownParent", "")
         # RDN to reanimate under: prefer the server's msDS-LastKnownRDN, then the first line of
@@ -284,78 +273,45 @@ class NXCModule:
             return
 
         restored_dn = f"CN={rdn},{last_parent}"
-        # Reanimation is a single modify that BOTH sets the live DN and drops isDeleted. Order matters:
-        # distinguishedName must come before isDeleted (mirrors bloodyAD), otherwise some DCs apply
-        # only the RDN rename and leave the object tombstoned.
-        ldap_session.modify(
-            dn=entry.entry_dn,
-            changes={
-                "distinguishedName": [(MODIFY_REPLACE, [restored_dn])],  # move it out to its live DN
-                "isDeleted": [(MODIFY_DELETE, [])],                      # drop the isDeleted attribute
-            },
-            controls=[(SHOW_DELETED_OID, True, None)],
-        )
+        try:
+            connection.ldap_connection.modify(
+                target["distinguishedName"],
+                # Reanimation is a single modify that BOTH sets the live DN and drops isDeleted.
+                # Order matters (impacket preserves this dict's order): distinguishedName must
+                # come first (mirrors bloodyAD), otherwise some DCs apply only the RDN rename
+                # and leave the object tombstoned.
+                {
+                    "distinguishedName": [(ldap_impacket.MODIFY_REPLACE, [restored_dn])],
+                    "isDeleted": [(ldap_impacket.MODIFY_DELETE, [])],
+                },
+                controls=[show_deleted_control()],
+            )
+        except ldap_impacket.LDAPSessionError as e:
+            context.log.fail(f"Restore was rejected: {e}")
+            return
 
-        # ldap3 can report success on a modify that only renamed the tombstone, so
-        # re-check the object and only report success once it is no longer deleted.
-        if self._still_deleted(ldap_session):
-            context.log.fail(f"Restore did not take effect - object is still a tombstone (LDAP result: {ldap_session.result.get('description')}).")
+        # A DC can accept the modify but apply only the rename, leaving the object tombstoned,
+        # so report success only once it is gone from the Deleted Objects container.
+        if self._find_by_guid(context, connection, ["isDeleted"]) is not None:
+            context.log.fail("Restore did not take effect - object is still a tombstone.")
             context.log.fail("This DC did not honor the single-modify reanimation; a ModifyDN-based tool such as bloodyAD's 'set restore' may be needed.")
             return
         context.log.success(f'Restored "{restored_dn}"')
 
-    def _search_deleted_by_guid(self, ldap_session, attributes):
-        """Search the Deleted Objects container for the tombstone with objectGUID=self.id and
-        return ldap_session.entries. objectGUID is binary and impacket's filter parser corrupts
-        bytes >= 0x80, so this lookup runs over the ldap3 session, which escapes binary correctly."""
-        guid_filter = escape_bytes(string_to_bin(self.id))
-        ldap_session.search(
-            self._deleted_objects_dn(),
-            f"(&(isDeleted=TRUE)(objectGUID={guid_filter}))",
-            search_scope=SUBTREE,
-            attributes=attributes,
-            controls=[(SHOW_DELETED_OID, True, None)],
-        )
-        return ldap_session.entries
-
-    def _still_deleted(self, ldap_session):
-        """Return True if the object with objectGUID=self.id is still a tombstone (isDeleted=TRUE)."""
-        return bool(self._search_deleted_by_guid(ldap_session, ["isDeleted"]))
-
     def delete_object(self, context, connection):
-        ldap_session = self._write_session(context)
-        if ldap_session is None:
-            return
-
         context.log.display(f"Deleting {self.deleteDN}")
-        success = ldap_session.delete(self.deleteDN)
 
-        if success:
-            context.log.success(f'Deleted "{self.deleteDN}"')
-        else:
-            context.log.fail(f'Failed to delete "{self.deleteDN}": {ldap_session.result}')
+        try:
+            connection.ldap_connection.delete(self.deleteDN, controls=[show_deleted_control()])
+        except ldap_impacket.LDAPSessionError as e:
+            context.log.fail(f'Failed to delete "{self.deleteDN}": {e}')
+            return
+        context.log.success(f'Deleted "{self.deleteDN}"')
 
     def on_login(self, context, connection):
         if not self.ready:
             return
-        self.__domain = connection.domain
         self.__base_dn = connection.baseDN
-        self.__username = connection.username
-        self.__password = connection.password
-        self.__host = connection.host
-        self.__kdcHost = connection.kdcHost
-        self.__aesKey = context.aesKey
-        self.__doKerberos = connection.kerberos
-        self.__lmhash = ""
-        self.__nthash = ""
-
-        if context.hash and context.hash[0]:
-            nt = context.hash[0]
-            if ":" in nt:
-                self.__lmhash, self.__nthash = nt.split(":")
-            else:
-                self.__lmhash = "00000000000000000000000000000000"
-                self.__nthash = nt
 
         actions = {
             "query": self.enumerate_tombstones,
