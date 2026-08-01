@@ -68,8 +68,6 @@ class NXCModule:
     description = "Audit accessible shares and report which user/group has WRITE on which path"
     category = CATEGORY.ENUMERATION
     supported_protocols = ["smb"]
-    opsec_safe = True       # read-only by default; VERIFY creates+deletes a temp file
-    multiple_hosts = True
 
     # -------------------------------------------------------------------------------
     def options(self, context, module_options):
